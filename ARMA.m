@@ -25,7 +25,8 @@ for d = d_candidates
     for p = 0:max_p
         for q = 0:max_q
             try
-                include_const = (d==0);             % d>0 通常不估计常数
+                % d=0 时估计均值；d=1 时估计漂移，可显著改善长期预测
+                include_const = (d<=1);
                 [phi, theta, c, sigma2, logL] = fit_arma(yd, p, q, include_const);
                 k = p + q + (include_const~=0);
                 aic = -2*logL + 2*k;
@@ -175,10 +176,49 @@ function [phi, theta, c, sigma2, logL] = fit_arma(y, p, q, include_const)
         phi=[]; theta=[]; return;
     end
     k = p+q + (include_const~=0);
-    init = zeros(k,1); init(1:p+q) = 0.1*randn(p+q,1); if include_const, init(end)=mean(y); end
-    options = optimset('MaxIter',3000,'Display','off','TolFun',1e-7,'TolX',1e-7);
-    params = fminsearch(@(w) nll_wrap(y,w,p,q,include_const), init, options);
-    [phi,theta,c,~,sigma2,logL] = unpack_and_eval(y,params,p,q,include_const);
+    if include_const
+        base_c = mean(y);
+    else
+        base_c = 0;
+    end
+    % -------- 多起点优化：显著降低陷入局部最优的概率 --------
+    num_starts = max(5, 2*(p+q));
+    options = optimset('MaxIter',4000,'Display','off','TolFun',1e-7,'TolX',1e-7);
+    best = struct('nll',inf,'params',[],'phi',[],'theta',[],'c',0,'sigma2',NaN,'logL',-inf);
+
+    for s = 1:num_starts
+        init = zeros(k,1);
+        if p+q>0
+            init(1:p+q) = 0.6*randn(p+q,1);
+        end
+        if include_const
+            init(end) = base_c * (1 + 0.2*randn);
+        end
+        if s==1
+            % 第一次使用更保守的初始值（更接近 0）
+            if p+q>0, init(1:p+q) = 0.1*randn(p+q,1); end
+            if include_const, init(end) = base_c; end
+        end
+
+        params = fminsearch(@(w) nll_wrap(y,w,p,q,include_const), init, options);
+        nll = nll_wrap(y, params, p, q, include_const);
+        if ~isfinite(nll), continue; end
+        [phi_tmp,theta_tmp,c_tmp,~,sigma2_tmp,logL_tmp] = unpack_and_eval(y,params,p,q,include_const);
+        if ~all(isfinite([phi_tmp(:); theta_tmp(:); c_tmp; sigma2_tmp; logL_tmp]))
+            continue;
+        end
+        if nll < best.nll
+            best = struct('nll',nll,'params',params,'phi',phi_tmp,'theta',theta_tmp, ...
+                'c',c_tmp,'sigma2',sigma2_tmp,'logL',logL_tmp);
+        end
+    end
+
+    if ~isfinite(best.nll)
+        error('ARMA 优化未收敛，尝试减少 p/q 或检查数据');
+    end
+
+    phi = best.phi; theta = best.theta; c = best.c;
+    sigma2 = best.sigma2; logL = best.logL;
 end
 
 function nll = nll_wrap(y, w, p, q, include_const)
